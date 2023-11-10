@@ -1,0 +1,207 @@
+---
+title: "Analogy Prediction with Embeddings"
+author: "Pedro Teles"
+date: "November 2023"
+theme: flatly
+format:
+  html:
+    toc: true
+    self-contained: true
+    code-tools:
+      source: true
+      toggle: true
+---
+
+# Introduction
+
+This project aims to forecast analogies utilizing word embeddings, leveraging the [Text8](http://mattmahoney.net/dc/text8.zip) corpus—a refined version of the English Wikipedia dump as of March 3, 2006. This dataset encompasses 17,005,207 words and features a diverse vocabulary of 253,854 unique terms. 
+
+For evaluation, the [questions-words](https://github.com/nicholas-leonard/word2vec/blob/master/questions-words.txt) dataset, comprising 19,544 analogies across 14 categories (like capital-common countries, family, and currency) and 14,064 distinct words, is utilized. 
+
+Given that both datasets are preprocessed, our preprocessing involved solely the elimination of stopwords from the Text8 corpus. Had the datasets not been preprocessed, additional steps like tokenization, conversion to lowercase, and removal of punctuation, numbers, and special characters would have been necessary.
+
+We evaluate using cosine similarity between the predicted and actual words, calculated as:
+
+$$ \text{cosine similarity} = \frac{\mathbf{w}_1 \cdot \mathbf{w}_2}{\|\mathbf{w}_1\| \times \|\mathbf{w}_2\|} $$
+
+Here, $\mathbf{w_1}$ and $\mathbf{w_2}$ represent the embeddings of the predicted and actual words, respectively.
+
+For comprehensive analysis, we compute the mean and standard deviation of the cosine similarity across analogies. The final score is derived from the average of these means, normalized by their standard deviations, ensuring accuracy and consistency in the model.
+
+Additionally, we utilize the [Optuna](https://optuna.org/) library for hyperparameter tuning, exploring various combinations to optimize performance. Key hyperparameters from the [Gensim](https://radimrehurek.com/gensim/models/word2vec.html) documentation include:
+
+- `vector_size`: The dimensionality of word vectors.
+- `sg`: The training algorithm, with 1 indicating skip-gram and 0 CBOW.
+- `alpha`: The initial learning rate.
+- `window`: The maximum word distance in a sentence.
+- `hs`: Hierarchical softmax (1) or negative sampling (0).
+- `min_count`: Minimum frequency threshold for words.
+- `negative`: The count of "noise words" in negative sampling.
+- `ns_exponent`: Shapes the negative sampling distribution.
+- `min_alpha`: The final learning rate post-training.
+- `epochs`: The number of training iterations.
+
+# Import Libraries
+
+```{python}
+import pandas as pd
+import numpy as np
+import multiprocessing
+from nltk.corpus import stopwords
+
+# Hyperparameter Tuning
+import optuna
+from optuna.visualization import plot_contour, plot_optimization_history, plot_parallel_coordinate, plot_param_importances, plot_slice, plot_timeline
+
+# Word2Vec
+from gensim.models import Word2Vec
+from gensim.models.word2vec import Text8Corpus
+```
+
+# Import and Preprocess Data
+
+## Corpus
+
+```{python}
+text8_corpus = Text8Corpus('text8')
+
+sentences = []
+for sentence in text8_corpus:
+    sentences.append(sentence)
+
+# Remove Stopwords
+stop_words = set(stopwords.words('english'))
+
+filtered_sentences = []
+for sentence in sentences:
+    filtered_sentences.append([w for w in sentence if not w in stop_words])
+
+del sentences
+```
+
+## Evaluation Dataset (Analogies)
+
+```{python}
+evaluation_dataset = pd.read_table('questions-words.txt')\
+    .set_axis(["analogy"], axis=1)\
+    .assign(
+        analogy = lambda x: x["analogy"].str.lower(),
+        count_words = lambda x: x["analogy"].apply(lambda x: len(x.split(" ")))
+    )\
+    .query("count_words == 4")\
+    .sample(frac=1, random_state=42)\
+    .reset_index(drop=True)
+
+# Split into train and test
+train_size = int(0.7 * len(evaluation_dataset))
+train = evaluation_dataset[:train_size]["analogy"].to_list()
+test = evaluation_dataset[train_size:]["analogy"].to_list()
+```
+
+# Word2Vec Hyperparameter Tuning
+
+```{python}
+def cosine_similarity(x_i, x_j):
+    return np.dot(x_i, x_j) / (np.linalg.norm(x_i) * np.linalg.norm(x_j))
+
+def analogy_accuracy(model, analogy):
+    w1, w2, w3, w4 = analogy.split(" ")
+
+    try:
+        w1 = model.wv[w1]
+        w2 = model.wv[w2]
+        w3 = model.wv[w3]
+        w4 = model.wv[w4]
+    except KeyError:
+        return np.nan
+    
+    w4_hat = w1 - w2 + w3
+
+    return cosine_similarity(w4, w4_hat)
+```
+
+```{python}
+def objective(trial: optuna.Trial) -> float:
+    params = {
+        "sentences": filtered_sentences,
+        "workers": multiprocessing.cpu_count()-1,
+        "seed": 42,     
+        "vector_size": trial.suggest_int("vector_size", 50, 150),# 300 may be better
+        "sg": trial.suggest_categorical("sg", [0, 1]),
+        "alpha": trial.suggest_float("alpha", 0.0001, 0.01, log=True),
+        "window": trial.suggest_int("window", 2, 10),
+        "epochs": trial.suggest_int("epochs", 5, 15),
+        #"hs": trial.suggest_categorical("hs", [0, 1]),
+        #"min_count": trial.suggest_int("min_count", 1, 5),
+        #"negative": trial.suggest_int("negative", 5, 20),
+        #"ns_exponent": trial.suggest_float("ns_exponent", 0.0001, 1.0, log=True),
+        #"min_alpha": trial.suggest_float("min_alpha", 0.0001, 0.01, log=True),
+    }
+
+    w2v_model = Word2Vec(**params)
+
+    similarity = [analogy_accuracy(w2v_model, analogy) for analogy in train]
+
+    return np.nanmean(similarity) / np.nanstd(similarity)
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=300, timeout=28800) # 8 hours
+```
+
+# Results
+
+## Best Parameters and Test Score
+
+```{python}
+print(f"Best Parameters: {study.best_params}\n")
+
+w2v_model = Word2Vec(
+    **study.best_params, 
+    sentences=filtered_sentences, 
+    workers=multiprocessing.cpu_count()-1, 
+    seed=42
+)
+
+similarity = [analogy_accuracy(w2v_model, analogy) for analogy in test]
+
+print("Results for Test Set:")
+print(f"    Mean: {round(np.nanmean(similarity), 3)}, Std: {round(np.nanstd(similarity), 3)}")
+```
+
+## Optimization History
+
+```{python}
+plot_optimization_history(study)
+```
+
+## Parallel Coordinate
+
+```{python}
+plot_parallel_coordinate(study)
+```
+
+## Hyperparameter Importance
+
+```{python}
+plot_param_importances(study)
+```
+
+## Contour
+
+```{python}
+plot_contour(study)
+```
+
+## Slice
+
+```{python}
+plot_slice(study)
+```
+
+## Timeline
+
+```{python}
+#| warning: false
+
+plot_timeline(study)
+```
